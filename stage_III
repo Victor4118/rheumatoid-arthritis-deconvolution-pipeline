@@ -1,1 +1,721 @@
+# ==============================================================================
+# Etapa III | Deconvolucion de STRAP con firma sinovial propia y validacion
+# TFM Bioinformatica | Victor Daniel Velasco Perez
+# ==============================================================================
 
+graphics.off()
+set.seed(42)
+
+# ==============================================================================
+# 0. SETUP & GLOBAL CONSTANTS
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(EPIC)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(patchwork)
+  library(pROC)
+})
+
+base_dir <- "C:/Master en Bioinformatica/TFM"
+setwd(base_dir)
+
+entrada   <- "resultados/etapa_2/datos"
+salida    <- "resultados/etapa_3"
+graficos  <- file.path(salida, "graficos")
+tablas    <- file.path(salida, "tablas")
+datos_dir <- file.path(salida, "datos")
+
+invisible(lapply(c(graficos, tablas, datos_dir), dir.create, recursive = TRUE, showWarnings = FALSE))
+
+UMBRAL_CONCORDANCIA <- 0.4
+RUTA_METADATOS      <- "data/metadata_STRAP.txt"
+SUBCLASES_AMP       <- c(paste0("SC-F", 1:4), paste0("SC-T", 1:6), paste0("SC-B", 1:4), paste0("SC-M", 1:4))
+
+PALETA          <- c(CIBERSORTx = "#0072B2", EPIC = "#D55E00", EPIC_sangre = "#009E73")
+PALETA_PATOTIPO <- c(Lymphoid = "#0072B2", Myeloid = "#D55E00", Fibroid = "#009E73")
+PALETA_B        <- c(Bpoor = "#0072B2", Brich = "#D55E00")
+LINAJES         <- c(T_cell = "Linfocitos T", B_cell = "Linfocitos B", Monocyte = "Macrofagos", Fibroblast = "Fibroblastos")
+
+tema <- theme_bw(11) +
+  theme(
+    strip.background      = element_rect(fill = "grey92", colour = "grey30"),
+    strip.text            = element_text(face = "bold"),
+    panel.grid.minor      = element_blank(),
+    axis.title            = element_text(face = "bold"),
+    plot.title            = element_text(face = "bold", size = 13),
+    plot.subtitle         = element_text(colour = "grey25"),
+    plot.caption          = element_text(hjust = 0, size = 8, colour = "grey35"),
+    plot.title.position   = "plot", 
+    plot.caption.position = "plot",
+    legend.position       = "bottom"
+  )
+
+guardar <- function(figura, archivo, ancho = 9, alto = 6) {
+  suppressWarnings(
+    ggsave(file.path(graficos, archivo), figura, device = "jpeg", width = ancho, height = alto, dpi = 300, bg = "white")
+  )
+}
+
+canonizar <- function(x) {
+  sub("^-|-$", "", gsub("[^A-Za-z0-9]+", "-", trimws(x)))
+}
+
+linaje_de <- function(x) {
+  case_when(
+    grepl("SC[-_. ]?T|T[-_. ]?cell|CD4|CD8|Treg", x, ignore.case = TRUE) ~ "T_cell",
+    grepl("SC[-_. ]?B|B[-_. ]?cell|Plasma",       x, ignore.case = TRUE) ~ "B_cell",
+    grepl("SC[-_. ]?M|Monocyte|Macrophage|Myeloid", x, ignore.case = TRUE) ~ "Monocyte",
+    grepl("SC[-_. ]?F|Fibroblast|CAF",             x, ignore.case = TRUE) ~ "Fibroblast",
+    TRUE ~ "Other"
+  )
+}
+
+# ==============================================================================
+# 1. MIXTURE & QUALITY CONTROL
+# ==============================================================================
+cat("\n[+] Stage III | Mixture and quality control\n")
+
+archivo_mezcla <- file.path(entrada, "STRAP_Mixture.txt")
+stopifnot(file.exists(archivo_mezcla))
+
+mezcla       <- as.matrix(read.delim(archivo_mezcla, row.names = "GeneSymbol", check.names = FALSE))
+mode(mezcla) <- "numeric"
+sufijos      <- ifelse(grepl("[-_.]", colnames(mezcla)), sub(".*[-_.]", "", colnames(mezcla)), NA)
+
+qc_mezcla <- tibble(
+  comprobacion = c("Genes", "Muestras", "Valor maximo", "Escala inferida", "Ceros (%)", "Puntos temporales"),
+  valor        = c(
+    nrow(mezcla), 
+    ncol(mezcla), 
+    sprintf("%.1f", max(mezcla)),
+    if (max(mezcla) < 50) "log2" else "lineal",
+    sprintf("%.1f", 100 * mean(mezcla == 0)),
+    if (all(is.na(sufijos))) "sin sufijo" else paste(names(table(sufijos)), table(sufijos), sep = ": ", collapse = " | ")
+  )
+)
+
+print(as.data.frame(qc_mezcla), row.names = FALSE)
+write_csv(qc_mezcla, file.path(tablas, "QC_mezcla_bulk.csv"))
+
+if (max(mezcla) < 50) {
+  stop("Mezcla en log2; ambos algoritmos exigen escala lineal.")
+}
+
+if (!all(is.na(sufijos)) && length(unique(sufijos)) > 1) {
+  basal <- grepl("baseline|-BL$|_BL$|w0$", colnames(mezcla), ignore.case = TRUE)
+  if (!any(basal)) stop("Varios puntos temporales y ninguno reconocido como basal.")
+  mezcla <- mezcla[, basal, drop = FALSE]
+}
+
+mapa_muestras <- tibble(Sample = colnames(mezcla))
+write_csv(mapa_muestras, file.path(datos_dir, "Mapa_muestras.csv"))
+
+# ==============================================================================
+# 2. SIGNATURE AUDIT
+# ==============================================================================
+cat("\n[+] Auditing signatures\n")
+
+leer_firma <- function(granularidad) {
+  bruto <- read.delim(file.path(entrada, paste0("Signature_Matrix_", granularidad, ".txt")), check.names = FALSE)
+  matriz <- as.matrix(bruto[, -1, drop = FALSE])
+  rownames(matriz) <- bruto$GeneSymbol
+  matriz[is.na(matriz)] <- 0
+  return(matriz)
+}
+
+firmas <- list(CLASS = leer_firma("CLASS"), SUBCLASS = leer_firma("SUBCLASS"))
+
+auditar <- function(matriz, granularidad) {
+  correlaciones <- cor(matriz, method = "spearman")
+  diag(correlaciones) <- NA
+  pares <- which(abs(correlaciones) > 0.7, arr.ind = TRUE)
+  pares <- pares[pares[, 1] < pares[, 2], , drop = FALSE]
+  
+  resumen_tbl <- tibble(
+    Granularidad             = granularidad, 
+    Genes                    = nrow(matriz), 
+    Tipos                    = ncol(matriz),
+    Kappa                    = round(kappa(matriz, exact = TRUE), 1),
+    Valor_maximo             = round(max(matriz), 1),
+    Cobertura_STRAP_pct      = round(100 * mean(rownames(matriz) %in% rownames(mezcla)), 1),
+    Tipos_menos_5_marcadores = sum(colSums(matriz != 0) < 5),
+    Pares_colineales         = nrow(pares)
+  )
+  
+  colineales_tbl <- if (nrow(pares) == 0) tibble() else {
+    tibble(
+      Granularidad = granularidad,
+      tipo_A       = rownames(correlaciones)[pares[, 1]],
+      tipo_B       = colnames(correlaciones)[pares[, 2]],
+      rho          = round(correlaciones[pares], 2)
+    ) %>% arrange(desc(abs(rho)))
+  }
+  
+  list(resumen = resumen_tbl, colineales = colineales_tbl)
+}
+
+auditorias <- lapply(names(firmas), function(g) auditar(firmas[[g]], g))
+auditoria  <- bind_rows(lapply(auditorias, `[[`, "resumen"))
+colineales <- bind_rows(lapply(auditorias, `[[`, "colineales"))
+
+print(as.data.frame(auditoria), row.names = FALSE)
+write_csv(auditoria, file.path(tablas, "QC_auditoria_firma.csv"))
+write_csv(colineales, file.path(tablas, "QC_pares_colineales.csv"))
+
+write_csv(
+  tibble(Subclase = SUBCLASES_AMP, Presente = SUBCLASES_AMP %in% colnames(firmas$SUBCLASS)),
+  file.path(tablas, "QC_cobertura_subclases.csv")
+)
+
+if (any(auditoria$Kappa > 100)) {
+  warning("Numero de condicion sobre 100: reducir marcadores en la Etapa II.")
+}
+
+# ==============================================================================
+# 3. EPIC DECONVOLUTION
+# ==============================================================================
+cat("\n[+] Running EPIC\n")
+
+convergencia <- list()
+
+epic_propio <- function(matriz, granularidad) {
+  comunes <- intersect(rownames(matriz), rownames(mezcla))
+  ajuste  <- EPIC(
+    bulk           = mezcla[comunes, , drop = FALSE],
+    reference      = list(refProfiles = matriz[comunes, , drop = FALSE], sigGenes = comunes),
+    withOtherCells = TRUE
+  )
+  
+  convergencia[[granularidad]] <<- tibble(
+    Sample       = rownames(ajuste$cellFractions), 
+    Granularidad = granularidad,
+    codigo       = ajuste$fit.gof$convergeCode,
+    convergio    = ajuste$fit.gof$convergeCode == 0
+  )
+  
+  ajuste$cellFractions %>% 
+    as.data.frame() %>% 
+    rownames_to_column("Sample") %>%
+    pivot_longer(-Sample, names_to = "CellType", values_to = "Score") %>%
+    mutate(
+      CellType     = canonizar(CellType), 
+      Method       = "EPIC",
+      Granularidad = granularidad
+    )
+}
+
+epic_class <- epic_propio(firmas$CLASS, "CLASS")
+epic_sub   <- epic_propio(firmas$SUBCLASS, "SUBCLASS")
+
+convergencia <- bind_rows(convergencia)
+print(table(convergencia$Granularidad, convergencia$convergio))
+write_csv(convergencia, file.path(tablas, "QC_convergencia_EPIC.csv"))
+
+epic_sangre <- EPIC(bulk = mezcla)$cellFractions %>% 
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(-Sample, names_to = "CellType", values_to = "Score") %>%
+  mutate(
+    CellType     = canonizar(CellType), 
+    Method       = "EPIC_sangre",
+    Granularidad = "CONTROL"
+  )
+
+residual <- bind_rows(epic_class, epic_sub, epic_sangre) %>%
+  filter(CellType == "otherCells") %>%
+  group_by(Method, Granularidad) %>%
+  summarise(
+    mediana = round(median(Score), 4),
+    q1      = round(quantile(Score, 0.25), 4),
+    q3      = round(quantile(Score, 0.75), 4), 
+    n       = n(), 
+    .groups = "drop"
+  )
+
+print(as.data.frame(residual), row.names = FALSE)
+write_csv(residual, file.path(tablas, "T_compartimento_residual.csv"))
+
+# ==============================================================================
+# 4. CIBERSORTX RESULTS
+# ==============================================================================
+cat("\n[+] Loading CIBERSORTx results\n")
+
+leer_cibersortx <- function(granularidad) {
+  archivo <- file.path("data", paste0("CIBERSORTx_Results_STRAP_", granularidad, ".csv"))
+  if (!file.exists(archivo)) {
+    message("Falta ", archivo)
+    return(tibble())
+  }
+  
+  bruto <- read.csv(archivo, check.names = FALSE)
+  names(bruto)[1] <- "Sample"
+  
+  if ("P-value" %in% names(bruto)) {
+    cat(sprintf("    %s: %d de %d muestras con p > 0,05\n", granularidad, sum(bruto$`P-value` > 0.05, na.rm = TRUE), nrow(bruto)))
+  }
+  
+  bruto %>%
+    select(-any_of(c("P-value", "Correlation", "RMSE", "Absolute score (sig.score)"))) %>%
+    pivot_longer(-Sample, names_to = "CellType", values_to = "Score") %>%
+    mutate(
+      CellType     = canonizar(CellType), 
+      Method       = "CIBERSORTx",
+      Granularidad = granularidad
+    )
+}
+
+cbx_class <- leer_cibersortx("CLASS")
+cbx_sub   <- leer_cibersortx("SUBCLASS")
+
+# ==============================================================================
+# 5. CONSOLIDATION
+# ==============================================================================
+cat("\n[+] Consolidating data\n")
+
+todos_resultados <- bind_rows(epic_class, epic_sub, epic_sangre, cbx_class, cbx_sub) %>%
+  mutate(Linaje_Global = linaje_de(CellType)) %>%
+  filter(CellType != "otherCells")
+
+sin_linaje <- unique(todos_resultados$CellType[todos_resultados$Linaje_Global == "Other" & todos_resultados$Method != "EPIC_sangre"])
+if (length(sin_linaje)) stop("Sin linaje: ", paste(sin_linaje, collapse = ", "))
+
+for (g in c("CLASS", "SUBCLASS")) {
+  e  <- filter(todos_resultados, Method == "EPIC", Granularidad == g)
+  c_ <- filter(todos_resultados, Method == "CIBERSORTx", Granularidad == g)
+  if (!nrow(c_)) next
+  
+  huerfanas <- union(setdiff(e$CellType, c_$CellType), setdiff(c_$CellType, e$CellType))
+  if (length(huerfanas)) stop("Etiquetas sin correspondencia en ", g, ": ", paste(huerfanas, collapse = ", "))
+}
+
+saveRDS(todos_resultados, file.path(datos_dir, "todos_resultados.rds"))
+write_csv(todos_resultados, file.path(tablas, "todos_resultados.csv"))
+
+composicion <- todos_resultados %>%
+  group_by(Granularidad, Method, Linaje_Global, CellType) %>%
+  summarise(
+    mediana   = round(median(Score), 4),
+    q1        = round(quantile(Score, 0.25), 4),
+    q3        = round(quantile(Score, 0.75), 4),
+    ceros_pct = round(100 * mean(Score == 0), 1), 
+    n         = n(),
+    .groups   = "drop"
+  ) %>%
+  arrange(Granularidad, Method, desc(mediana))
+
+write_csv(composicion, file.path(tablas, "T_composicion_celular.csv"))
+
+# ==============================================================================
+# 6. COMPOSITION FIGURES
+# ==============================================================================
+cat("\n[+] Generating composition figures\n")
+
+figura_composicion <- function(granularidad, alto) {
+  seleccion <- filter(todos_resultados, Granularidad == granularidad, Linaje_Global != "Other")
+  if (!nrow(seleccion)) return(invisible(NULL))
+  
+  orden <- seleccion %>% 
+    filter(Method == "EPIC") %>% 
+    group_by(CellType) %>%
+    summarise(m = median(Score), .groups = "drop") %>% 
+    arrange(m) %>%
+    pull(CellType)
+    
+  figura <- seleccion %>%
+    mutate(
+      CellType = factor(CellType, orden),
+      Linaje   = factor(LINAJES[Linaje_Global], levels = LINAJES)
+    ) %>%
+    ggplot(aes(Score, CellType, fill = Method)) +
+    geom_boxplot(outlier.size = 0.6, linewidth = 0.3, alpha = 0.85) +
+    facet_grid(Linaje ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_manual(values = PALETA, name = "Metodo:") + 
+    tema +
+    labs(
+      title    = "Composicion Celular Estimada en la Cohorte STRAP",
+      subtitle = paste0("Firma sinovial propia, granularidad ", granularidad, ", biopsias basales"),
+      x        = "Fraccion Estimada", 
+      y        = NULL,
+      caption  = paste("Las fracciones son relativas a las poblaciones que la",
+                       "firma modela. El compartimento residual estimado por",
+                       "EPIC se excluye\nde la representacion y se reporta por separado.")
+    )
+    
+  guardar(figura, paste0("G01_Composicion_", granularidad, ".jpg"), 9, alto)
+}
+
+figura_composicion("CLASS", 5)
+figura_composicion("SUBCLASS", 8)
+
+# ==============================================================================
+# 7. METHOD CONCORDANCE
+# ==============================================================================
+cat("\n[+] Evaluating method concordance\n")
+
+concordancia <- todos_resultados %>%
+  filter(Method %in% c("EPIC", "CIBERSORTx"), Linaje_Global != "Other") %>%
+  pivot_wider(names_from = Method, values_from = Score) %>%
+  filter(!is.na(EPIC), !is.na(CIBERSORTx)) %>%
+  group_by(Granularidad, Linaje_Global, CellType) %>%
+  filter(sd(EPIC) > 0, sd(CIBERSORTx) > 0, n() > 3) %>%
+  summarise(
+    n           = n(),
+    Spearman    = round(cor(EPIC, CIBERSORTx, method = "spearman"), 3),
+    Pearson     = round(cor(EPIC, CIBERSORTx), 3),
+    dif_mediana = round(median(CIBERSORTx - EPIC), 4), 
+    .groups     = "drop"
+  ) %>%
+  arrange(Granularidad, desc(Spearman))
+
+print(as.data.frame(concordancia), row.names = FALSE)
+write_csv(concordancia, file.path(tablas, "T_concordancia_metodos.csv"))
+
+fiables <- concordancia %>%
+  transmute(
+    Granularidad, 
+    Linaje_Global, 
+    CellType, 
+    Spearman,
+    fiable = Spearman >= UMBRAL_CONCORDANCIA
+  )
+write_csv(fiables, file.path(tablas, "T_poblaciones_fiables.csv"))
+cat(sprintf("    Poblaciones fiables: %d de %d\n", sum(fiables$fiable), nrow(fiables)))
+
+p_concordancia <- concordancia %>%
+  mutate(
+    Linaje   = factor(LINAJES[Linaje_Global], levels = LINAJES),
+    CellType = reorder(CellType, Spearman)
+  ) %>%
+  ggplot(aes(Spearman, CellType, colour = Linaje)) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_vline(xintercept = UMBRAL_CONCORDANCIA, linetype = "dashed", colour = "#c0392b") +
+  geom_segment(aes(x = 0, xend = Spearman, yend = CellType), colour = "grey70") +
+  geom_point(size = 3) +
+  facet_wrap(~ Granularidad, scales = "free_y") +
+  scale_colour_manual(values = c("#0072B2", "#D55E00", "#009E73", "#CC79A7"), name = NULL) +
+  xlim(min(0, min(concordancia$Spearman)), 1) + 
+  tema +
+  labs(
+    title    = "Concordancia entre CIBERSORTx y EPIC por Poblacion Celular",
+    subtitle = "Correlacion de Spearman entre fracciones estimadas con la misma firma",
+    x        = "Rho de Spearman", 
+    y        = NULL,
+    caption  = paste("Ambos algoritmos comparten la firma sinovial, de modo",
+                     "que la concordancia evalua la firma y no los",
+                     "algoritmos. La linea roja marca\nel umbral de 0,4 por",
+                     "debajo del cual el perfil no se considera",
+                     "suficientemente discriminativo.")
+  )
+
+guardar(p_concordancia, "G02_Concordancia_Metodos.jpg", 10, 7)
+
+# ==============================================================================
+# 8. ORTHOGONALITY
+# ==============================================================================
+cat("\n[+] Calculating orthogonality\n")
+
+matriz_ancha <- function(metodo, granularidad) {
+  larga <- todos_resultados %>%
+    filter(Method == metodo, Granularidad == granularidad, Linaje_Global != "Other") %>%
+    select(Sample, CellType, Score) %>%
+    pivot_wider(names_from = CellType, values_from = Score)
+    
+  matriz <- as.matrix(larga[, -1, drop = FALSE])
+  rownames(matriz) <- larga$Sample
+  return(matriz)
+}
+
+correlacion_cruzada <- function(granularidad) {
+  epic <- matriz_ancha("EPIC", granularidad)
+  cbx  <- matriz_ancha("CIBERSORTx", granularidad)
+  
+  if (!nrow(cbx)) return(NULL)
+  
+  muestras <- intersect(rownames(epic), rownames(cbx))
+  tipos    <- intersect(colnames(epic), colnames(cbx))
+  
+  suppressWarnings(cor(epic[muestras, tipos], cbx[muestras, tipos], method = "spearman"))
+}
+
+cruzadas <- Filter(Negate(is.null), lapply(c(CLASS = "CLASS", SUBCLASS = "SUBCLASS"), correlacion_cruzada))
+
+if (length(cruzadas)) {
+  cruzada_larga <- bind_rows(lapply(names(cruzadas), function(g) {
+    as.data.frame(cruzadas[[g]]) %>% 
+      rownames_to_column("EPIC") %>%
+      pivot_longer(-EPIC, names_to = "CIBERSORTx", values_to = "rho") %>%
+      mutate(
+        Granularidad = g, 
+        Linaje_EPIC  = linaje_de(EPIC),
+        Linaje_CBX   = linaje_de(CIBERSORTx), 
+        diagonal     = EPIC == CIBERSORTx
+      )
+  }))
+  
+  write_csv(cruzada_larga, file.path(tablas, "T_ortogonalidad_metodos.csv"))
+  
+  ortogonalidad <- cruzada_larga %>%
+    filter(Granularidad == "CLASS" | Linaje_EPIC == Linaje_CBX) %>%
+    group_by(Granularidad, Linaje_EPIC, EPIC) %>%
+    summarise(
+      rho_diagonal      = rho[diagonal][1],
+      rho_maximo_vecino = suppressWarnings(max(rho[!diagonal], na.rm = TRUE)),
+      vecino            = CIBERSORTx[!diagonal][which.max(rho[!diagonal])][1],
+      .groups           = "drop"
+    ) %>%
+    mutate(
+      rho_maximo_vecino = ifelse(is.finite(rho_maximo_vecino), rho_maximo_vecino, NA_real_),
+      margen            = round(rho_diagonal - rho_maximo_vecino, 3),
+      resuelta          = !is.na(margen) & margen > 0,
+      across(c(rho_diagonal, rho_maximo_vecino), ~ round(.x, 3))
+    ) %>%
+    arrange(Granularidad, desc(margen))
+    
+  print(as.data.frame(ortogonalidad), row.names = FALSE)
+  write_csv(ortogonalidad, file.path(tablas, "T_margen_ortogonalidad.csv"))
+  
+  pie_ortogonalidad <- paste(
+    "Cada celda es la correlacion entre la estimacion de un metodo para una",
+    "poblacion y la del otro metodo para otra poblacion del mismo linaje.",
+    "El recuadro\nnegro senala la diagonal. Una firma que resuelve sus",
+    "subpoblaciones produce una matriz diagonal. Al tratarse de fracciones que",
+    "suman la unidad, parte\nde la correlacion negativa fuera de la diagonal",
+    "procede de la restriccion composicional y no de una confusion entre poblaciones."
+  )
+  
+  heatmap_cruzado <- function(seleccion, titulo, subtitulo) {
+    ggplot(seleccion, aes(CIBERSORTx, EPIC)) +
+      geom_tile(aes(fill = rho), colour = "white", linewidth = 1) +
+      geom_tile(data = filter(seleccion, diagonal), fill = NA, colour = "black", linewidth = 0.9) +
+      geom_text(aes(label = ifelse(is.na(rho), "", sprintf("%.2f", rho))), size = 3) +
+      scale_fill_gradient2(
+        limits = c(-1, 1), low = "#0072B2", mid = "grey97",
+        high = "#D55E00", na.value = "grey90", name = "Rho de Spearman"
+      ) +
+      coord_fixed() + 
+      tema +
+      theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = titulo, subtitle = subtitulo, x = "CIBERSORTx", y = "EPIC", caption = pie_ortogonalidad)
+  }
+  
+  guardar(
+    heatmap_cruzado(
+      filter(cruzada_larga, Granularidad == "CLASS"),
+      "Ortogonalidad entre CIBERSORTx y EPIC en los Linajes Sinoviales",
+      "Correlacion cruzada de todas las estimaciones frente a todas"
+    ),
+    "G06_Ortogonalidad_CLASS.jpg", 8, 7
+  )
+  
+  paneles <- list()
+  for (linaje in names(LINAJES)) {
+    seleccion <- filter(cruzada_larga, Granularidad == "SUBCLASS", Linaje_EPIC == linaje, Linaje_CBX == linaje)
+    if (!nrow(seleccion)) next
+    
+    lado <- 3.5 + 0.7 * length(unique(seleccion$EPIC))
+    figura <- heatmap_cruzado(
+      seleccion,
+      paste0("Ortogonalidad entre Metodos: ", LINAJES[[linaje]]),
+      "Correlacion cruzada entre las subpoblaciones de un mismo linaje"
+    )
+    
+    guardar(figura, paste0("G07_Ortogonalidad_", linaje, ".jpg"), lado, lado)
+    
+    paneles[[linaje]] <- figura +
+      labs(title = LINAJES[[linaje]], subtitle = NULL, caption = NULL) +
+      theme(legend.position = "none")
+  }
+  
+  if (length(paneles) > 1) {
+    guardar(
+      wrap_plots(paneles, ncol = 2) +
+        plot_annotation(
+          title    = "Ortogonalidad entre CIBERSORTx y EPIC por Linaje",
+          subtitle = "Correlacion cruzada dentro de cada linaje; el recuadro negro marca la diagonal",
+          caption  = pie_ortogonalidad, 
+          theme    = tema
+        ),
+      "G08_Ortogonalidad_Panel_Linajes.jpg", 13, 12
+    )
+  }
+}
+
+# ==============================================================================
+# 9. EXTERNAL VALIDATION
+# ==============================================================================
+cat("\n[+] External validation\n")
+
+if (!file.exists(RUTA_METADATOS)) {
+  message("Validacion externa omitida: falta ", RUTA_METADATOS)
+} else {
+  bruto <- read.delim(RUTA_METADATOS, check.names = FALSE, stringsAsFactors = FALSE)
+  
+  columna <- function(nombre, numerica = FALSE) {
+    posicion <- which(names(bruto) == nombre)[1]
+    if (is.na(posicion)) {
+      warning("Columna ausente en los metadatos: ", nombre)
+      return(rep(NA, nrow(bruto)))
+    }
+    valores <- bruto[[posicion]]
+    if (numerica) suppressWarnings(as.numeric(valores)) else as.character(valores)
+  }
+  
+  metadatos <- tibble(
+    Sample          = columna("Characteristics[sampleid]"),
+    Paciente        = columna("Characteristics[individual]"),
+    Patotipo        = columna("Characteristics[pathotype]"),
+    Compartimento_B = columna("Characteristics[cell.type (bcell)]"),
+    Edad            = columna("Characteristics[age]", TRUE),
+    Sexo            = columna("Characteristics[sex]"),
+    FR              = columna("Characteristics[rf_status]"),
+    ACPA            = columna("Characteristics[ccp_status]"),
+    TJC             = columna("Characteristics[tender_joints_counts_tjc]", TRUE),
+    SJC             = columna("Characteristics[swollen_joints_counts_sjc]", TRUE),
+    VSG             = columna("Characteristics[esr]", TRUE),
+    PCR             = columna("Characteristics[crp]", TRUE),
+    ACR20           = columna("Characteristics[acr20_response]")
+  ) %>%
+    distinct(Sample, .keep_all = TRUE) %>%
+    mutate(
+      Patotipo = recode(Patotipo, Fibrous = "Fibroid"),
+      Patotipo = na_if(Patotipo, "Ungraded"),
+      across(c(Patotipo, Compartimento_B, Sexo, FR, ACPA), ~ na_if(.x, "NA"))
+    )
+  
+  print(table(metadatos$Patotipo, metadatos$Compartimento_B, useNA = "ifany"))
+  print(table(metadatos$ACR20, useNA = "ifany"))
+  write_csv(metadatos, file.path(tablas, "T_metadatos_clinicos.csv"))
+  
+  validacion <- todos_resultados %>%
+    filter(Method %in% c("EPIC", "CIBERSORTx"), Linaje_Global != "Other") %>%
+    inner_join(metadatos, by = "Sample")
+    
+  cat(sprintf("    Muestras emparejadas: %d\n", n_distinct(validacion$Sample)))
+  if (!n_distinct(validacion$Sample)) stop("Sin correspondencia de identificadores.")
+  
+  compartimento_b <- validacion %>%
+    filter(!is.na(Compartimento_B)) %>%
+    group_by(Granularidad, Method, Linaje_Global, CellType) %>%
+    filter(n_distinct(Compartimento_B) == 2, sd(Score) > 0) %>%
+    summarise(
+      n             = n(),
+      mediana_Brich = round(median(Score[Compartimento_B == "Brich"]), 4),
+      mediana_Bpoor = round(median(Score[Compartimento_B == "Bpoor"]), 4),
+      p             = wilcox.test(Score ~ factor(Compartimento_B))$p.value,
+      AUC           = round(as.numeric(auc(roc(
+                        factor(Compartimento_B), Score, quiet = TRUE,
+                        levels = c("Bpoor", "Brich"), direction = "<"))), 3),
+      .groups       = "drop"
+    ) %>%
+    group_by(Granularidad, Method) %>%
+    mutate(p_ajustada = p.adjust(p, method = "BH")) %>% 
+    ungroup() %>%
+    arrange(desc(AUC))
+    
+  print(as.data.frame(compartimento_b), row.names = FALSE)
+  write_csv(compartimento_b, file.path(tablas, "T_validacion_compartimento_B.csv"))
+  
+  esperado <- c(B_cell = "Lymphoid", T_cell = "Lymphoid", Monocyte = "Myeloid", Fibroblast = "Fibroid")
+  
+  patotipo <- validacion %>%
+    filter(!is.na(Patotipo)) %>%
+    group_by(Granularidad, Method, Linaje_Global, CellType) %>%
+    filter(n_distinct(Patotipo) == 3, sd(Score) > 0) %>%
+    summarise(
+      n                = n(), 
+      p                = kruskal.test(Score ~ factor(Patotipo))$p.value,
+      mediana_Lymphoid = round(median(Score[Patotipo == "Lymphoid"]), 4),
+      mediana_Myeloid  = round(median(Score[Patotipo == "Myeloid"]), 4),
+      mediana_Fibroid  = round(median(Score[Patotipo == "Fibroid"]), 4),
+      .groups          = "drop"
+    ) %>%
+    mutate(
+      patotipo_dominante = case_when(
+        mediana_Lymphoid >= mediana_Myeloid & mediana_Lymphoid >= mediana_Fibroid ~ "Lymphoid",
+        mediana_Myeloid >= mediana_Fibroid ~ "Myeloid", 
+        TRUE ~ "Fibroid"
+      ),
+      patotipo_esperado = unname(esperado[Linaje_Global]),
+      correcto          = patotipo_dominante == patotipo_esperado
+    ) %>%
+    group_by(Granularidad, Method) %>%
+    mutate(p_ajustada = p.adjust(p, method = "BH")) %>% 
+    ungroup() %>%
+    arrange(p_ajustada)
+    
+  print(as.data.frame(patotipo), row.names = FALSE)
+  write_csv(patotipo, file.path(tablas, "T_validacion_patotipo.csv"))
+  cat(sprintf("    Maximo en el patotipo esperado: %d de %d\n", sum(patotipo$correcto), nrow(patotipo)))
+  
+  p_val_b <- validacion %>%
+    filter(!is.na(Compartimento_B), Granularidad == "CLASS") %>%
+    mutate(Linaje = factor(LINAJES[Linaje_Global], levels = LINAJES)) %>%
+    ggplot(aes(Compartimento_B, Score, fill = Compartimento_B)) +
+    geom_boxplot(outlier.size = 0.6, linewidth = 0.3, alpha = 0.85) +
+    facet_grid(Method ~ Linaje, scales = "free_y") +
+    scale_fill_manual(values = PALETA_B, name = NULL) + 
+    tema +
+    labs(
+      title    = "Fracciones Estimadas segun la Estratificacion Histologica en Linfocitos B",
+      subtitle = "Clasificacion asignada por el patologo sobre la biopsia basal",
+      x        = NULL, 
+      y        = "Fraccion Estimada",
+      caption  = paste("La clasificacion en B-cell rich y B-cell poor procede de la lectura",
+                       "histologica y es independiente de la deconvolucion.\nSe espera que",
+                       "el compartimento B separe ambos grupos y que los demas linajes no lo hagan.")
+    )
+  guardar(p_val_b, "G09_Validacion_Compartimento_B.jpg", 10, 6)
+  
+  p_val_p <- validacion %>%
+    filter(!is.na(Patotipo), Granularidad == "CLASS") %>%
+    mutate(
+      Linaje   = factor(LINAJES[Linaje_Global], levels = LINAJES),
+      Patotipo = factor(Patotipo, levels = names(PALETA_PATOTIPO))
+    ) %>%
+    ggplot(aes(Patotipo, Score, fill = Patotipo)) +
+    geom_boxplot(outlier.size = 0.6, linewidth = 0.3, alpha = 0.85) +
+    facet_grid(Method ~ Linaje, scales = "free_y") +
+    scale_fill_manual(values = PALETA_PATOTIPO, name = NULL) + 
+    tema +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    labs(
+      title    = "Fracciones Estimadas segun el Patotipo Sinovial Histologico",
+      subtitle = "Patotipo asignado por el patologo sobre la biopsia basal",
+      x        = NULL, 
+      y        = "Fraccion Estimada",
+      caption  = paste("Se espera que cada linaje alcance su valor maximo en el patotipo",
+                       "que lleva su nombre: linfoide para los linfocitos,\nmieloide para",
+                       "los macrofagos y fibroide para los fibroblastos.")
+    )
+  guardar(p_val_p, "G10_Validacion_Patotipo.jpg", 10, 6)
+  
+  p_val_sub <- validacion %>%
+    filter(!is.na(Patotipo), Granularidad == "SUBCLASS", Method == "CIBERSORTx") %>%
+    semi_join(filter(fiables, fiable), by = c("Granularidad", "CellType")) %>%
+    mutate(Patotipo = factor(Patotipo, levels = names(PALETA_PATOTIPO))) %>%
+    ggplot(aes(Patotipo, Score, fill = Patotipo)) +
+    geom_boxplot(outlier.size = 0.5, linewidth = 0.25, alpha = 0.85) +
+    facet_wrap(~ CellType, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = PALETA_PATOTIPO, name = NULL) + 
+    tema +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    labs(
+      title    = "Subpoblaciones Fiables segun el Patotipo Sinovial",
+      subtitle = "Estimaciones de CIBERSORTx en las poblaciones que superaron el criterio de concordancia",
+      x        = NULL, 
+      y        = "Fraccion Estimada",
+      caption  = "Solo se representan las subpoblaciones cuya estimacion concordo entre ambos algoritmos."
+    )
+  guardar(p_val_sub, "G11_Validacion_Patotipo_Subclases.jpg", 11, 7)
+}
+
+# ==============================================================================
+# 10. PERSISTENCE
+# ==============================================================================
+writeLines(capture.output(sessionInfo()), file.path(tablas, "sessionInfo.txt"))
+cat("\n[+] Etapa III completada |", nrow(todos_resultados), "estimaciones |", n_distinct(todos_resultados$Sample), "muestras\n")

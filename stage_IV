@@ -1,1 +1,515 @@
+# ==============================================================================
+# ETAPA IV | Descriptiva de la cohorte y arbol de decision del patotipo sinovial
+# Master's Thesis in Bioinformatics | Victor Daniel Velasco Perez
+#
+# Input   data/metadata_STRAP_local_xlx.txt      (SDRF de ArrayExpress)
+#         resultados/etapa_3/datos/todos_resultados.rds
+#         resultados/etapa_3/tablas/T_poblaciones_fiables.csv   (opcional)
+# Output  resultados/etapa_4/{graficos, tablas, datos}
+# Style   tidyverse style guide; seed 42
+#
+# The script reads the submission file directly and derives everything it needs,
+# so it introduces no new data dependency.
+#
+# The acr20_response field of the submission reports five responders out of 208
+# where the trial publishes 133. It is discarded here and no contrast is run
+# against it, following the supervisor's instruction.
+#
+# WHAT THE PATHOTYPE IS. It is not a clinical variable and it is not a cluster.
+# A pathologist stains four sequential sections of the biopsy for CD20 (B
+# cells), CD3 (T cells), CD138 (plasma cells) and CD68 (sublining macrophages),
+# grades each on a semiquantitative scale from 0 to 4, and applies a fixed rule:
+#   lympho-myeloid  CD20 >= 2 and/or CD138 > 2
+#   diffuse-myeloid CD68SL >= 2 with CD20 <= 1 and CD138 <= 2
+#   pauci-immune    CD68SL < 2 and CD3, CD20, CD138 all < 1
+# The grade is therefore a deterministic function of four cell abundances read
+# under a microscope, which is exactly what deconvolution tries to estimate from
+# expression. The trees below ask whether the computational estimate recovers
+# that reading, and whether the clinical phenotype carries the same information.
+#
+# HONESTY OF THE ESTIMATE. A tree read on the observations that trained it
+# reports memorisation. Every accuracy reported here comes from repeated
+# stratified cross-validation with the complexity parameter tuned inside each
+# training fold. The tree that is drawn is fitted on the full cohort for
+# interpretation only, and its apparent accuracy is never reported as
+# performance.
+# ==============================================================================
 
+graphics.off()
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(rpart)
+})
+hay_rpart_plot <- requireNamespace("rpart.plot", quietly = TRUE)
+
+base_dir <- "C:/Master en Bioinformatica/TFM"
+setwd(base_dir)
+
+dir_graf <- "resultados/etapa_4/graficos"
+dir_tab  <- "resultados/etapa_4/tablas"
+dir_dat  <- "resultados/etapa_4/datos"
+invisible(lapply(c(dir_graf, dir_tab, dir_dat), dir.create,
+                 recursive = TRUE, showWarnings = FALSE))
+
+N_REPETICIONES <- 20
+N_PLIEGUES     <- 10
+AUSENTES <- c("", "NA", "not applicable", "not available", "unknown")
+
+PALETA <- c(Fibroid = "#009E73", Myeloid = "#D55E00", Lymphoid = "#0072B2")
+
+# Fallback reliability set from Stage III, used only if the table is absent.
+FIABLES_SUBCLASS <- c("SC-B4", "SC-F3", "SC-M4", "SC-F4", "SC-F2", "SC-M2",
+                      "SC-M3", "SC-T6", "SC-T3", "SC-T1")
+FIABLES_CLASS <- c("Fibroblast", "B_cell", "Monocyte")
+
+tema <- theme_bw(11) +
+  theme(strip.background = element_rect(fill = "grey92", colour = "grey30"),
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(colour = "grey25"),
+        plot.caption = element_text(hjust = 0, size = 8, colour = "grey35"),
+        plot.title.position = "plot", plot.caption.position = "plot",
+        legend.position = "bottom")
+
+guardar <- function(plot, archivo, ancho = 9, alto = 6) {
+  suppressWarnings(ggsave(file.path(dir_graf, archivo), plot = plot,
+                          device = "jpeg", width = ancho, height = alto,
+                          dpi = 300, bg = "white"))
+}
+
+# ==============================================================================
+# 1. CLINICAL TABLE DERIVED FROM THE SUBMISSION FILE
+# ==============================================================================
+
+ruta_sdrf <- file.path("data", "metadata_STRAP.txt")
+if (!file.exists(ruta_sdrf)) stop("No se encuentra ", ruta_sdrf)
+
+sdrf <- read_tsv(ruta_sdrf, show_col_types = FALSE, na = AUSENTES,
+                 name_repair = "unique", progress = FALSE)
+
+CAMPOS <- c(individuo = "Characteristics[individual]",
+            muestra   = "Characteristics[sampleid]",
+            edad      = "Characteristics[age]",
+            sexo      = "Characteristics[sex]",
+            etnia     = "Characteristics[ethnicity]",
+            fr        = "Characteristics[rf_status]",
+            acpa      = "Characteristics[ccp_status]",
+            tjc       = "Characteristics[tender_joints_counts_tjc]",
+            sjc       = "Characteristics[swollen_joints_counts_sjc]",
+            eva_pac   = "Characteristics[arthritis.activity]",
+            esr       = "Characteristics[esr]",
+            crp       = "Characteristics[crp]",
+            eva_med   = "Characteristics[physicians.global.assessment]",
+            celulas_b = "Characteristics[cell.type (bcell)]",
+            patotipo  = "Characteristics[pathotype]")
+faltan <- setdiff(CAMPOS, names(sdrf))
+if (length(faltan) > 0) stop("Campos ausentes en el SDRF: ",
+                             paste(faltan, collapse = ", "))
+
+clinico <- sdrf %>%
+  select(all_of(CAMPOS)) %>%
+  distinct(muestra, .keep_all = TRUE) %>%
+  transmute(
+    Paciente     = individuo,
+    Edad         = as.numeric(edad),
+    Sexo         = factor(sexo),
+    Etnia        = factor(etnia),
+    FR           = factor(fr, levels = c("negative", "positive")),
+    ACPA         = factor(acpa, levels = c("negative", "positive")),
+    TJC28        = as.numeric(tjc),
+    SJC28        = as.numeric(sjc),
+    VSG          = as.numeric(esr),
+    PCR          = as.numeric(crp),
+    EVA_paciente = as.numeric(eva_pac),
+    EVA_medico   = as.numeric(eva_med),
+    Clase_B      = factor(celulas_b, levels = c("Bpoor", "Brich")),
+    Patotipo     = factor(dplyr::recode(patotipo, Fibrous = "Fibroid",
+                                        Ungraded = NA_character_),
+                          levels = c("Fibroid", "Myeloid", "Lymphoid"))) %>%
+  mutate(
+    DAS28_VSG = 0.56 * sqrt(TJC28) + 0.28 * sqrt(SJC28) +
+      0.70 * log(pmax(VSG, 1)) + 0.014 * EVA_paciente,
+    DAS28_PCR = 0.56 * sqrt(TJC28) + 0.28 * sqrt(SJC28) +
+      0.36 * log(PCR + 1) + 0.014 * EVA_paciente + 0.96,
+    CDAI = TJC28 + SJC28 + EVA_paciente / 10 + EVA_medico / 10,
+    SDAI = CDAI + PCR / 10)
+
+if (nrow(clinico) != 210) stop("Se esperaban 210 muestras y hay ", nrow(clinico))
+if (any(duplicated(clinico$Paciente))) stop("Pacientes repetidos en el SDRF.")
+
+cat(sprintf("\n[1] Cohorte: %d biopsias basales | patotipo graduado en %d | clase B en %d\n",
+            nrow(clinico), sum(!is.na(clinico$Patotipo)),
+            sum(!is.na(clinico$Clase_B))))
+
+# ==============================================================================
+# 2. DESCRIPTIVE TABLE BY PATHOTYPE
+# ==============================================================================
+
+# Continuous variables are summarised by median and interquartile range because
+# none of the activity indices is symmetric. Epsilon squared and Cramer's V are
+# reported so that the reader sees magnitude and not only a p value.
+
+resumen_continua <- function(x, g) {
+  ok <- !is.na(x) & !is.na(g)
+  x <- x[ok]; g <- droplevels(g[ok])
+  por_grupo <- tapply(x, g, function(v)
+    sprintf("%.1f [%.1f-%.1f]", median(v), quantile(v, .25), quantile(v, .75)))
+  pr <- kruskal.test(x, g)
+  k <- nlevels(g); n <- length(x)
+  tibble(Global = sprintf("%.1f [%.1f-%.1f]", median(x),
+                          quantile(x, .25), quantile(x, .75)),
+         !!!as.list(por_grupo),
+         n_valido = n,
+         Efecto = sprintf("eps2 = %.3f",
+                          (unname(pr$statistic) - k + 1) / (n - k)),
+         p = signif(pr$p.value, 3))
+}
+
+resumen_categorica <- function(x, g) {
+  ok <- !is.na(x) & !is.na(g)
+  x <- droplevels(factor(x[ok])); g <- droplevels(g[ok])
+  tb <- table(x, g)
+  ref <- levels(x)[nlevels(x)]
+  pct <- function(v) sprintf("%d (%.1f %%)", sum(v == ref),
+                             100 * mean(v == ref))
+  por_grupo <- tapply(x, g, pct)
+  pr <- fisher.test(tb, simulate.p.value = TRUE, B = 10000)
+  v <- sqrt(unname(suppressWarnings(chisq.test(tb)$statistic)) /
+              (length(x) * (min(dim(tb)) - 1)))
+  tibble(Global = pct(x), !!!as.list(por_grupo), n_valido = length(x),
+         Efecto = sprintf("V = %.3f", v), p = signif(pr$p.value, 3))
+}
+
+CONTINUAS <- c("Edad", "TJC28", "SJC28", "VSG", "PCR", "EVA_paciente",
+               "EVA_medico", "DAS28_VSG", "DAS28_PCR", "CDAI", "SDAI")
+CATEGORICAS <- c("Sexo", "FR", "ACPA", "Clase_B")
+
+tabla_1 <- bind_rows(
+  lapply(CONTINUAS, function(v)
+    resumen_continua(clinico[[v]], clinico$Patotipo) %>%
+      mutate(Variable = v, Tipo = "mediana [RIC]", .before = 1)),
+  lapply(CATEGORICAS, function(v)
+    resumen_categorica(clinico[[v]], clinico$Patotipo) %>%
+      mutate(Variable = v, Tipo = "n (%) del nivel de referencia", .before = 1))) %>%
+  mutate(p_ajustada = signif(p.adjust(p, method = "BH"), 3))
+
+print(as.data.frame(tabla_1), row.names = FALSE)
+write_csv(tabla_1, file.path(dir_tab, "T_descriptiva_por_patotipo.csv"))
+
+reparto <- clinico %>%
+  filter(!is.na(Patotipo)) %>%
+  count(Patotipo, Clase_B) %>%
+  pivot_wider(names_from = Clase_B, values_from = n, values_fill = 0)
+write_csv(reparto, file.path(dir_tab, "T_patotipo_por_clase_B.csv"))
+
+p_desc <- clinico %>%
+  filter(!is.na(Patotipo)) %>%
+  select(Patotipo, DAS28_VSG, CDAI, VSG, PCR, TJC28, SJC28) %>%
+  pivot_longer(-Patotipo, names_to = "Variable", values_to = "Valor") %>%
+  filter(!is.na(Valor)) %>%
+  ggplot(aes(Patotipo, Valor, fill = Patotipo)) +
+  geom_boxplot(outlier.size = 0.6, linewidth = 0.3, alpha = 0.85) +
+  facet_wrap(~ Variable, scales = "free_y") +
+  scale_fill_manual(values = PALETA, name = NULL) +
+  tema + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+  labs(title = "Actividad Clinica Basal segun el Patotipo Sinovial",
+       x = NULL, y = "Valor",
+       caption = paste("El patotipo se asigna por inmunohistoquimica y no",
+                       "incorpora ninguna de estas variables, de modo que",
+                       "cualquier diferencia\nes una asociacion observada y no",
+                       "una consecuencia de la definicion."))
+guardar(p_desc, "G01_Clinica_por_Patotipo.jpg", 9, 6)
+
+# ==============================================================================
+# 3. ESTIMATED COMPOSITION IN LOG-RATIO COORDINATES
+# ==============================================================================
+
+ruta_res <- file.path("resultados/etapa_3/datos", "todos_resultados.rds")
+if (!file.exists(ruta_res)) stop("No se encuentra ", ruta_res)
+
+resultados <- readRDS(ruta_res) %>%
+  filter(Linaje_Global != "Other") %>%
+  mutate(CellType = gsub("_", "-", CellType))
+
+ruta_fiables <- file.path("resultados/etapa_3/tablas", "T_poblaciones_fiables.csv")
+if (file.exists(ruta_fiables)) {
+  fiables <- read_csv(ruta_fiables, show_col_types = FALSE) %>%
+    mutate(CellType = gsub("_", "-", CellType)) %>%
+    filter(fiable)
+  sel <- function(g) fiables$CellType[fiables$Granularidad == g]
+} else {
+  warning("T_poblaciones_fiables.csv ausente; se usa la lista de la Etapa III.")
+  sel <- function(g) if (g == "SUBCLASS") gsub("_", "-", FIABLES_SUBCLASS)
+  else gsub("_", "-", FIABLES_CLASS)
+}
+
+reemplazar_ceros <- function(M) {
+  limite <- apply(M, 2, function(x) {
+    p <- x[x > 0]
+    if (length(p) == 0) stop("Poblacion nula en toda la cohorte.")
+    0.65 * min(p)
+  })
+  M <- M / rowSums(M)
+  for (i in seq_len(nrow(M))) {
+    cero <- M[i, ] == 0
+    if (!any(cero)) next
+    masa <- sum(limite[cero])
+    if (masa >= 1) stop("La masa imputada agota la composicion.")
+    M[i, cero] <- limite[cero]
+    M[i, !cero] <- M[i, !cero] * (1 - masa)
+  }
+  M
+}
+
+# The reference of the transform is the analysable subcomposition, so every
+# coordinate is read relative to the populations that survived Stage III.
+construir_clr <- function(metodo, granularidad) {
+  poblaciones <- sel(granularidad)
+  sub <- resultados %>%
+    filter(Method == metodo, Granularidad == granularidad,
+           CellType %in% poblaciones)
+  if (nrow(sub) == 0) return(NULL)
+  ancha <- sub %>% select(Sample, CellType, Score) %>%
+    pivot_wider(names_from = CellType, values_from = Score)
+  if (any(is.na(ancha))) stop("Valores ausentes tras el pivotado.")
+  M <- as.matrix(ancha[, -1, drop = FALSE]); rownames(M) <- ancha$Sample
+  if (any(M < 0)) stop("Estimaciones negativas en la composicion.")
+  L <- log(reemplazar_ceros(M))
+  as.data.frame(L - rowMeans(L)) %>%
+    rownames_to_column("Sample") %>%
+    mutate(Paciente = sub("[-_.][^-_.]+$", "", Sample), .before = 1)
+}
+
+METODO <- ifelse("CIBERSORTx" %in% resultados$Method, "CIBERSORTx", resultados$Method[1])
+clr_sub <- construir_clr(METODO, "SUBCLASS")
+if (is.null(clr_sub)) stop("No hay resultados de subclase para ", METODO)
+if (n_distinct(clr_sub$Paciente) != nrow(clr_sub)) {
+  stop("El recorte del sufijo funde muestras distintas en el mismo paciente.")
+}
+
+datos <- clinico %>%
+  inner_join(select(clr_sub, -Sample), by = "Paciente") %>%
+  filter(!is.na(Patotipo)) %>%
+  mutate(Patotipo = droplevels(Patotipo))
+if (nrow(datos) < 100) stop("Enlace insuficiente entre composicion y clinica: ",
+                            nrow(datos), " pacientes.")
+
+VAR_CLINICAS <- c("Edad", "Sexo", "FR", "ACPA", "TJC28", "SJC28", "VSG", "PCR",
+                  "EVA_paciente", "EVA_medico", "DAS28_VSG", "CDAI")
+VAR_COMPOSICION <- setdiff(names(clr_sub), c("Sample", "Paciente"))
+
+cat(sprintf("[3] %d pacientes con patotipo y composicion | %d poblaciones analizables\n",
+            nrow(datos), length(VAR_COMPOSICION)))
+
+# ==============================================================================
+# 4. DECISION TREES
+# ==============================================================================
+
+pliegues_estratificados <- function(y, k) {
+  indice <- integer(length(y))
+  for (nivel in levels(y)) {
+    pos <- which(y == nivel)
+    indice[sample(pos)] <- rep_len(seq_len(k), length(pos))
+  }
+  indice
+}
+
+ajustar_podado <- function(formula, entrenamiento) {
+  fit <- rpart(formula, data = entrenamiento, method = "class",
+               control = rpart.control(cp = 0, minbucket = 5, xval = 10))
+  tab <- fit$cptable
+  objetivo <- min(tab[, "xerror"]) + tab[which.min(tab[, "xerror"]), "xstd"]
+  cp_opt <- tab[which(tab[, "xerror"] <= objetivo)[1], "CP"]
+  prune(fit, cp = cp_opt)
+}
+
+metricas <- function(observado, predicho, niveles) {
+  observado <- factor(observado, levels = niveles)
+  predicho  <- factor(predicho,  levels = niveles)
+  tb <- table(observado, predicho)
+  n <- sum(tb)
+  exactitud <- sum(diag(tb)) / n
+  recall <- diag(tb) / pmax(rowSums(tb), 1)
+  esperado <- sum(rowSums(tb) * colSums(tb)) / n^2
+  list(exactitud = exactitud,
+       equilibrada = mean(recall),
+       kappa = (exactitud - esperado) / (1 - esperado),
+       recall = recall, tabla = tb)
+}
+
+validar <- function(predictoras, etiqueta) {
+  predictoras_escapadas <- paste0("`", predictoras, "`")
+  formula <- as.formula(paste("Patotipo ~", paste(predictoras_escapadas, collapse = " + ")))
+  niveles <- levels(datos$Patotipo)
+  acumulado <- matrix(0, length(niveles), length(niveles),
+                      dimnames = list(niveles, niveles))
+  filas <- vector("list", N_REPETICIONES)
+  
+  for (r in seq_len(N_REPETICIONES)) {
+    indice <- pliegues_estratificados(datos$Patotipo, N_PLIEGUES)
+    predicho <- factor(rep(NA, nrow(datos)), levels = niveles)
+    for (k in seq_len(N_PLIEGUES)) {
+      fit <- ajustar_podado(formula, datos[indice != k, ])
+      predicho[indice == k] <- predict(fit, datos[indice == k, ], type = "class")
+    }
+    m <- metricas(datos$Patotipo, predicho, niveles)
+    acumulado <- acumulado + m$tabla
+    filas[[r]] <- c(exactitud = m$exactitud, equilibrada = m$equilibrada,
+                    kappa = m$kappa, m$recall)
+  }
+  
+  M <- do.call(rbind, filas)
+  nir <- max(table(datos$Patotipo)) / nrow(datos)
+  resumen <- tibble(Modelo = etiqueta,
+                    n = nrow(datos),
+                    predictoras = length(predictoras),
+                    exactitud = round(mean(M[, "exactitud"]), 3),
+                    ic_inf = round(unname(quantile(M[, "exactitud"], .025)), 3),
+                    ic_sup = round(unname(quantile(M[, "exactitud"], .975)), 3),
+                    equilibrada = round(mean(M[, "equilibrada"]), 3),
+                    kappa = round(mean(M[, "kappa"]), 3),
+                    tasa_sin_informacion = round(nir, 3),
+                    p_binomial = signif(binom.test(
+                      round(mean(M[, "exactitud"]) * nrow(datos)),
+                      nrow(datos), nir, alternative = "greater")$p.value, 3))
+  recalls <- as_tibble(t(round(colMeans(M[, niveles, drop = FALSE]), 3))) %>%
+    mutate(Modelo = etiqueta, .before = 1)
+  
+  list(resumen = resumen, recall = recalls,
+       confusion = round(acumulado / N_REPETICIONES, 1))
+}
+
+cat("[4] Validacion cruzada repetida en curso...\n")
+modelos <- list(
+  clinico     = validar(VAR_CLINICAS, "Solo clinicas"),
+  composicion = validar(VAR_COMPOSICION, "Solo composicion estimada"),
+  conjunto    = validar(c(VAR_CLINICAS, VAR_COMPOSICION), "Clinicas y composicion"))
+
+rendimiento <- bind_rows(lapply(modelos, `[[`, "resumen"))
+recalls <- bind_rows(lapply(modelos, `[[`, "recall"))
+print(as.data.frame(rendimiento), row.names = FALSE)
+print(as.data.frame(recalls), row.names = FALSE)
+write_csv(rendimiento, file.path(dir_tab, "T_rendimiento_arboles.csv"))
+write_csv(recalls, file.path(dir_tab, "T_sensibilidad_por_patotipo.csv"))
+
+confusiones <- bind_rows(lapply(names(modelos), function(nm) {
+  as.data.frame(as.table(modelos[[nm]]$confusion)) %>%
+    setNames(c("Observado", "Predicho", "Media")) %>%
+    mutate(Modelo = modelos[[nm]]$resumen$Modelo, .before = 1)
+}))
+write_csv(confusiones, file.path(dir_tab, "T_matrices_confusion.csv"))
+
+# ==============================================================================
+# 5. INTERPRETABLE TREE FITTED ON THE FULL COHORT
+# ==============================================================================
+
+# Se escapan todas las variables con acentos graves (backticks) para que el
+# parser de fórmulas de R no interprete los guiones como restas matemáticas.
+variables_todas <- c(VAR_CLINICAS, VAR_COMPOSICION)
+variables_escapadas <- paste0("`", variables_todas, "`")
+
+formula_final <- as.formula(paste("Patotipo ~",
+                                  paste(variables_escapadas, collapse = " + ")))
+
+arbol <- ajustar_podado(formula_final, datos)
+saveRDS(arbol, file.path(dir_dat, "arbol_patotipo.rds"))
+writeLines(capture.output(print(arbol)),
+           file.path(dir_tab, "T_reglas_arbol.txt"))
+
+importancia <- tibble(Variable = names(arbol$variable.importance),
+                      Importancia = as.numeric(arbol$variable.importance)) %>%
+  mutate(Bloque = ifelse(Variable %in% VAR_COMPOSICION,
+                         "Composicion estimada", "Clinica"),
+         Relativa = round(100 * Importancia / sum(Importancia), 1)) %>%
+  arrange(desc(Importancia))
+write_csv(importancia, file.path(dir_tab, "T_importancia_variables.csv"))
+print(as.data.frame(head(importancia, 15)), row.names = FALSE)
+
+jpeg(file.path(dir_graf, "G02_Arbol_Patotipo.jpg"), width = 2700, height = 1800,
+     res = 300, quality = 100)
+if (hay_rpart_plot) {
+  rpart.plot::rpart.plot(arbol, type = 2, extra = 104, box.palette = "Grays",
+                         branch.lty = 1, tweak = 1.1, cex = NULL,
+                         main = "Arbol de Decision del Patotipo Sinovial")
+} else {
+  plot(arbol, uniform = TRUE, margin = 0.12,
+       main = "Arbol de Decision del Patotipo Sinovial")
+  text(arbol, use.n = TRUE, cex = 0.75)
+}
+invisible(dev.off())
+
+p_imp <- importancia %>%
+  slice_head(n = 12) %>%
+  mutate(Variable = reorder(Variable, Relativa)) %>%
+  ggplot(aes(Relativa, Variable, fill = Bloque)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = c(Clinica = "#CC79A7",
+                               `Composicion estimada` = "#0072B2"),
+                    name = NULL) +
+  tema +
+  labs(title = "Contribucion de Cada Variable al Arbol de Decision",
+       subtitle = "Importancia relativa acumulada, incluidas las particiones subrogadas",
+       x = "Importancia Relativa (%)", y = NULL,
+       caption = paste("La importancia se calcula sobre el arbol ajustado a la",
+                       "cohorte completa y describe su estructura. El",
+                       "rendimiento se estima\naparte por validacion cruzada."))
+guardar(p_imp, "G03_Importancia_Variables.jpg", 9, 6)
+
+p_conf <- confusiones %>%
+  group_by(Modelo, Observado) %>%
+  mutate(Proporcion = Media / sum(Media)) %>%
+  ungroup() %>%
+  ggplot(aes(Predicho, Observado, fill = Proporcion)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.0f", Media)), size = 3.2) +
+  facet_wrap(~ Modelo) +
+  scale_fill_gradient(low = "#F0F0F0", high = "#0072B2",
+                      name = "Proporcion de la fila") +
+  tema +
+  labs(title = "Concordancia entre el Patotipo Predicho y el Patotipo Histologico",
+       subtitle = "Recuentos promediados sobre las repeticiones de validacion cruzada",
+       x = "Patotipo Predicho", y = "Patotipo Histologico",
+       caption = paste("Las cifras son recuentos medios de pacientes fuera del",
+                       "pliegue de entrenamiento. La diagonal recoge los",
+                       "aciertos."))
+guardar(p_conf, "G04_Matrices_Confusion.jpg", 11, 4.5)
+
+variables_top <- importancia %>%
+  filter(Variable %in% VAR_COMPOSICION) %>%
+  slice_head(n = 6) %>%
+  pull(Variable)
+
+if (length(variables_top) > 0) {
+  p_top <- datos %>%
+    select(Patotipo, all_of(variables_top)) %>%
+    pivot_longer(-Patotipo, names_to = "Poblacion", values_to = "CLR") %>%
+    ggplot(aes(Patotipo, CLR, fill = Patotipo)) +
+    geom_boxplot(outlier.size = 0.6, linewidth = 0.3, alpha = 0.85) +
+    facet_wrap(~ Poblacion, scales = "free_y") +
+    scale_fill_manual(values = PALETA, name = NULL) +
+    tema + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    labs(title = "Poblaciones Estimadas que el Arbol Utiliza para Separar Patotipos",
+         subtitle = paste("Coordenadas logaritmicas centradas,", METODO),
+         x = NULL, y = "CLR de la Fraccion Estimada",
+         caption = paste("Solo se representan poblaciones que superaron los",
+                         "criterios de fiabilidad de la Etapa III."))
+  guardar(p_top, "G05_Poblaciones_Discriminantes.jpg", 9, 6)
+}
+
+saveRDS(datos, file.path(dir_dat, "datos_etapa_4.rds"))
+writeLines(capture.output(sessionInfo()),
+           file.path(dir_tab, "sessionInfo_etapa_4.txt"))
+
+cat("\n[+] Etapa IV completada\n")
+cat(sprintf("   tasa sin informacion: %.3f | mejor modelo: %s (%.3f)\n",
+            rendimiento$tasa_sin_informacion[1],
+            rendimiento$Modelo[which.max(rendimiento$exactitud)],
+            max(rendimiento$exactitud)))
