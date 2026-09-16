@@ -1,6 +1,11 @@
 # ==============================================================================
-# Etapa III | Deconvolucion de STRAP con firma sinovial propia y validacion
-# TFM Bioinformatica | Victor Daniel Velasco Perez
+# Etapa III | Deconvolución y validación multi-algorítmica en STRAP
+# TFM Bioinformática | Víctor Daniel Velasco Pérez
+#
+# Source       Cohorte STRAP (210 biopsias basales, bulk RNA-seq) y metadatos
+# Output       Estimaciones de abundancia celular (EPIC, CIBERSORTx), análisis 
+#              de ortogonalidad y validación frente al patotipo histológico
+# Style        tidyverse style guide; HGNC symbols; fixed seed 42
 # ==============================================================================
 
 graphics.off()
@@ -41,7 +46,7 @@ PALETA_PATOTIPO <- c(Lymphoid = "#0072B2", Myeloid = "#D55E00", Fibroid = "#009E
 PALETA_B        <- c(Bpoor = "#0072B2", Brich = "#D55E00")
 LINAJES         <- c(T_cell = "Linfocitos T", B_cell = "Linfocitos B", Monocyte = "Macrofagos", Fibroblast = "Fibroblastos")
 
-tema <- theme_bw(11) +
+tema <- theme_bw(base_size = 11) +
   theme(
     strip.background      = element_rect(fill = "grey92", colour = "grey30"),
     strip.text            = element_text(face = "bold"),
@@ -56,9 +61,10 @@ tema <- theme_bw(11) +
   )
 
 guardar <- function(figura, archivo, ancho = 9, alto = 6) {
-  suppressWarnings(
-    ggsave(file.path(graficos, archivo), figura, device = "jpeg", width = ancho, height = alto, dpi = 300, bg = "white")
-  )
+  suppressWarnings({
+    ggsave(file.path(graficos, archivo), plot = figura, device = "jpeg", 
+           width = ancho, height = alto, dpi = 300, bg = "white")
+  })
 }
 
 canonizar <- function(x) {
@@ -68,7 +74,7 @@ canonizar <- function(x) {
 linaje_de <- function(x) {
   case_when(
     grepl("SC[-_. ]?T|T[-_. ]?cell|CD4|CD8|Treg", x, ignore.case = TRUE) ~ "T_cell",
-    grepl("SC[-_. ]?B|B[-_. ]?cell|Plasma",       x, ignore.case = TRUE) ~ "B_cell",
+    grepl("SC[-_. ]?B|B[-_. ]?cell|Plasma",        x, ignore.case = TRUE) ~ "B_cell",
     grepl("SC[-_. ]?M|Monocyte|Macrophage|Myeloid", x, ignore.case = TRUE) ~ "Monocyte",
     grepl("SC[-_. ]?F|Fibroblast|CAF",             x, ignore.case = TRUE) ~ "Fibroblast",
     TRUE ~ "Other"
@@ -131,10 +137,10 @@ leer_firma <- function(granularidad) {
 firmas <- list(CLASS = leer_firma("CLASS"), SUBCLASS = leer_firma("SUBCLASS"))
 
 auditar <- function(matriz, granularidad) {
-  correlaciones <- cor(matriz, method = "spearman")
+  correlaciones       <- cor(matriz, method = "spearman")
   diag(correlaciones) <- NA
-  pares <- which(abs(correlaciones) > 0.7, arr.ind = TRUE)
-  pares <- pares[pares[, 1] < pares[, 2], , drop = FALSE]
+  pares               <- which(abs(correlaciones) > 0.7, arr.ind = TRUE)
+  pares               <- pares[pares[, 1] < pares[, 2], , drop = FALSE]
   
   resumen_tbl <- tibble(
     Granularidad             = granularidad, 
@@ -153,7 +159,8 @@ auditar <- function(matriz, granularidad) {
       tipo_A       = rownames(correlaciones)[pares[, 1]],
       tipo_B       = colnames(correlaciones)[pares[, 2]],
       rho          = round(correlaciones[pares], 2)
-    ) %>% arrange(desc(abs(rho)))
+    ) %>% 
+      arrange(desc(abs(rho)))
   }
   
   list(resumen = resumen_tbl, colineales = colineales_tbl)
@@ -164,7 +171,7 @@ auditoria  <- bind_rows(lapply(auditorias, `[[`, "resumen"))
 colineales <- bind_rows(lapply(auditorias, `[[`, "colineales"))
 
 print(as.data.frame(auditoria), row.names = FALSE)
-write_csv(auditoria, file.path(tablas, "QC_auditoria_firma.csv"))
+write_csv(auditoria,  file.path(tablas, "QC_auditoria_firma.csv"))
 write_csv(colineales, file.path(tablas, "QC_pares_colineales.csv"))
 
 write_csv(
@@ -256,7 +263,8 @@ leer_cibersortx <- function(granularidad) {
   names(bruto)[1] <- "Sample"
   
   if ("P-value" %in% names(bruto)) {
-    cat(sprintf("    %s: %d de %d muestras con p > 0,05\n", granularidad, sum(bruto$`P-value` > 0.05, na.rm = TRUE), nrow(bruto)))
+    cat(sprintf("    %s: %d de %d muestras con p > 0,05\n", 
+                granularidad, sum(bruto$`P-value` > 0.05, na.rm = TRUE), nrow(bruto)))
   }
   
   bruto %>%
@@ -282,7 +290,9 @@ todos_resultados <- bind_rows(epic_class, epic_sub, epic_sangre, cbx_class, cbx_
   filter(CellType != "otherCells")
 
 sin_linaje <- unique(todos_resultados$CellType[todos_resultados$Linaje_Global == "Other" & todos_resultados$Method != "EPIC_sangre"])
-if (length(sin_linaje)) stop("Sin linaje: ", paste(sin_linaje, collapse = ", "))
+if (length(sin_linaje)) {
+  stop("Sin linaje: ", paste(sin_linaje, collapse = ", "))
+}
 
 for (g in c("CLASS", "SUBCLASS")) {
   e  <- filter(todos_resultados, Method == "EPIC", Granularidad == g)
@@ -383,6 +393,7 @@ fiables <- concordancia %>%
     Spearman,
     fiable = Spearman >= UMBRAL_CONCORDANCIA
   )
+
 write_csv(fiables, file.path(tablas, "T_poblaciones_fiables.csv"))
 cat(sprintf("    Poblaciones fiables: %d de %d\n", sum(fiables$fiable), nrow(fiables)))
 
@@ -439,7 +450,9 @@ correlacion_cruzada <- function(granularidad) {
   muestras <- intersect(rownames(epic), rownames(cbx))
   tipos    <- intersect(colnames(epic), colnames(cbx))
   
-  suppressWarnings(cor(epic[muestras, tipos], cbx[muestras, tipos], method = "spearman"))
+  suppressWarnings({
+    cor(epic[muestras, tipos], cbx[muestras, tipos], method = "spearman")
+  })
 }
 
 cruzadas <- Filter(Negate(is.null), lapply(c(CLASS = "CLASS", SUBCLASS = "SUBCLASS"), correlacion_cruzada))
@@ -494,12 +507,19 @@ if (length(cruzadas)) {
       geom_tile(data = filter(seleccion, diagonal), fill = NA, colour = "black", linewidth = 0.9) +
       geom_text(aes(label = ifelse(is.na(rho), "", sprintf("%.2f", rho))), size = 3) +
       scale_fill_gradient2(
-        limits = c(-1, 1), low = "#0072B2", mid = "grey97",
-        high = "#D55E00", na.value = "grey90", name = "Rho de Spearman"
+        limits   = c(-1, 1), 
+        low      = "#0072B2", 
+        mid      = "grey97",
+        high     = "#D55E00", 
+        na.value = "grey90", 
+        name     = "Rho de Spearman"
       ) +
       coord_fixed() + 
       tema +
-      theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1)) +
+      theme(
+        panel.grid  = element_blank(), 
+        axis.text.x = element_text(angle = 45, hjust = 1)
+      ) +
       labs(title = titulo, subtitle = subtitulo, x = "CIBERSORTx", y = "EPIC", caption = pie_ortogonalidad)
   }
   

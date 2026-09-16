@@ -49,7 +49,7 @@ umbral_deteccion_ambigua <- 0.5
 config_linajes <- list(
   list(
     linaje    = "T_cell", 
-    etiqueta  = "Linfocitos T", 
+    etiqueta  = "Célula T", 
     nfeatures = 1500, 
     pcs       = 15,
     pares     = list(c("FOXP3", "CXCL13"), c("CCR7", "GZMB"), c("CD4", "CD8A")),
@@ -58,7 +58,7 @@ config_linajes <- list(
   ),
   list(
     linaje    = "B_cell", 
-    etiqueta  = "Linfocitos B", 
+    etiqueta  = "Célula B", 
     nfeatures = 500,  
     pcs       = 8,
     pares     = list(c("IGHD", "PRDM1"), c("MS4A1", "SDC1")),
@@ -67,7 +67,7 @@ config_linajes <- list(
   ),
   list(
     linaje    = "Fibroblast", 
-    etiqueta  = "Fibroblastos Sinoviales", 
+    etiqueta  = "Fibroblasto", 
     nfeatures = 1000, 
     pcs       = 12,
     pares     = list(c("FAP", "PRG4"), c("THY1", "PRG4")),
@@ -76,7 +76,7 @@ config_linajes <- list(
   ),
   list(
     linaje    = "Monocyte", 
-    etiqueta  = "Macrofagos Sinoviales", 
+    etiqueta  = "Macrófago", 
     nfeatures = 800,  
     pcs       = 10,
     pares     = list(c("FCN1", "C1QA"), c("CXCL9", "LYVE1")),
@@ -181,7 +181,7 @@ for (cfg in config_linajes) {
       Marcadores_Min     = as.integer(marcadores["minimo"]),
       Marcadores_Mediana = as.integer(marcadores["mediana"]),
       N_Ambiguos         = n_amb,
-      Prop_Ambiguos      = n_amb / n_cl
+      Prop_Ambiguos      = round(n_amb / n_cl, 4)
     )
   })
   
@@ -189,36 +189,36 @@ for (cfg in config_linajes) {
   resumen_global[[cfg$linaje]] <- metricas
   
   p_arbol <- clustree(sub, prefix = "RNA_snn_res.") +
-    labs(title = cfg$etiqueta, subtitle = "Trasvase de celulas entre particiones consecutivas")
+    labs(title = cfg$etiqueta, subtitle = "Trasvase de células entre particiones consecutivas")
   
   p_silueta <- ggplot(metricas, aes(Resolucion, Ancho_Silueta)) +
     geom_line(colour = "grey50") +
     geom_point(size = 2) +
     tema_figura +
-    labs(title = "Separacion entre Subclusters",
+    labs(title = "Separación entre Subclusters",
          subtitle = "Anchura media de silueta sobre el espacio de componentes principales",
-         x = "Resolucion", y = "Anchura Media de Silueta")
+         x = "Resolución", y = "Anchura Media de Silueta")
   
   p_marcadores <- ggplot(metricas, aes(Resolucion, Marcadores_Min)) +
     geom_col(fill = "#2c7fb8") +
     tema_figura +
-    labs(title = "Capacidad Discriminativa del Subcluster Mas Debil",
+    labs(title = "Capacidad Discriminativa del Subcluster Más Débil",
          subtitle = "Genes marcadores que superan los filtros de la firma",
-         x = "Resolucion", y = "Numero de Genes Marcadores")
+         x = "Resolución", y = "Número de Genes Marcadores")
   
   p_ambiguos <- ggplot(metricas, aes(Resolucion, Prop_Ambiguos)) +
     geom_col(fill = "#c0392b") +
     scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
     tema_figura +
     labs(title = "Subclusters con Identidad Ambigua",
-         subtitle = paste0("Marcadores excluyentes detectados en mas del ",
-                           scales::percent(umbral_deteccion_ambigua), " de las celulas"),
-         x = "Resolucion", y = "Porcentaje de Subclusters")
+         subtitle = paste0("Marcadores excluyentes detectados en más del ",
+                           scales::percent(umbral_deteccion_ambigua), " de las células"),
+         x = "Resolución", y = "Porcentaje de Subclusters")
   
   p_panel <- p_arbol / (p_silueta | p_marcadores | p_ambiguos) +
     plot_layout(heights = c(2, 1)) +
-    plot_annotation(title = paste("Diagnostico de Resolucion:", cfg$etiqueta),
-                    subtitle = "Estabilidad, separacion y capacidad discriminativa",
+    plot_annotation(title = paste("Diagnóstico de Resolución:", cfg$etiqueta),
+                    subtitle = "Estabilidad, separación y capacidad discriminativa",
                     theme = tema_figura)
   
   print(p_panel)
@@ -228,10 +228,10 @@ for (cfg in config_linajes) {
   candidatas <- metricas$Resolucion[which(metricas$Prop_Ambiguos == 0)]
   if (length(candidatas) > 0) {
     r_sugerida <- min(candidatas)
-    estado_r   <- "ambiguedad nula"
+    estado_r   <- "ambigüedad nula"
   } else if (any(!is.na(metricas$Prop_Ambiguos))) {
     r_sugerida <- metricas$Resolucion[which.min(metricas$Prop_Ambiguos)]
-    estado_r   <- "minimo alcanzado, ambiguedad no nula"
+    estado_r   <- "mínimo alcanzado, ambigüedad no nula"
   } else {
     r_sugerida <- max(resoluciones)
     estado_r   <- "sin pares evaluables"
@@ -246,10 +246,10 @@ for (cfg in config_linajes) {
       tema_figura +
       theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "italic")) +
       labs(title = cfg$etiqueta,
-           subtitle = paste0("Resolucion = ", format(r_sugerida, decimal.mark = ","),
+           subtitle = paste0("Resolución = ", format(r_sugerida, nsmall = 1, decimal.mark = "."),
                              " (", estado_r, ")"),
            x = "Gen", y = "Subcluster",
-           colour = "Expresion Media", size = "Porcentaje Expresado")
+           colour = "Expresión Media", size = "Porcentaje Expresado")
     print(p_dot)
   })
   
